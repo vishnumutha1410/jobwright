@@ -1,0 +1,43 @@
+name: Jobwright digest
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"    # every 3 hours (UTC)
+  workflow_dispatch:          # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write             # allow committing the updated seen.json back
+
+concurrency:
+  group: jobwright
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 python-dotenv
+
+      - name: Run Jobwright digest
+        env:
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python digest_run.py
+
+      - name: Persist dedupe memory
+        run: |
+          git config user.name "jobwright-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add seen.json
+          git commit -m "chore: update seen.json [skip ci]" || echo "no changes to commit"
+          git push || echo "nothing to push"

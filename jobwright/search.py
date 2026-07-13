@@ -1,8 +1,9 @@
-"""Discover job listings from open Built In boards and resolve direct apply URLs.
+"""Discover job listings from open Built In boards, resolve direct apply URLs,
+and read each posting's real age + active status from its detail page.
 
-Robust, anchor-driven parser: instead of depending on fragile CSS class names,
-it finds every /job/<slug>/<id> link and reads the surrounding card text. This
-survives Built In markup changes far better than class selectors.
+Anchor-driven list parsing (robust to markup changes). For each job we open the
+detail page once to (a) get the direct company/ATS apply link, (b) read the
+"Posted X Days Ago" date reliably, and (c) skip roles that were removed/closed.
 """
 import re
 import time
@@ -15,8 +16,9 @@ from .models import Job
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; Jobwright/1.0; +portfolio-project)"}
 _JOB_HREF = re.compile(r"/job/[^/\"']+/\d+")
 _AGE_RE = re.compile(r"(\d+)\s+day", re.I)
-_SALARY_RE = re.compile(r"\$?\d{2,3}K\s*[-\u2013]\s*\$?\d{2,3}K", re.I)
+_SALARY_RE = re.compile(r"\$?\d{2,3}K\s*[-â€“]\s*\$?\d{2,3}K", re.I)
 _LOC_RE = re.compile(r"(Remote|Austin|Dallas|Houston|San Antonio|[A-Z][a-z]+,\s*[A-Z]{2})")
+_DEAD = ("was removed", "no longer accepting", "no longer available", "this job has expired")
 _ATS_HINTS = (
     "greenhouse.io", "ashbyhq.com", "lever.co", "myworkdayjobs.com",
     "smartrecruiters.com", "oraclecloud.com", "icims.com", "bamboohr.com",
@@ -61,11 +63,6 @@ def _title_matches(title):
     return any(tt in t for tt in TARGET_TITLES)
 
 
-def _entry(text):
-    t = text.lower()
-    return any(sig in t for sig in ENTRY_SIGNALS)
-
-
 def _skills(text):
     low, found = text.lower(), []
     for s in _SKILL_VOCAB:
@@ -75,7 +72,6 @@ def _skills(text):
 
 
 def _card_container(anchor):
-    """Walk up until we find the ancestor that also holds a /company/ link."""
     node = anchor
     for _ in range(6):
         node = node.parent
@@ -110,7 +106,6 @@ def parse_board(board_url):
             title=title,
             location=loc.group(0) if loc else "",
             salary=sal.group(0) if sal else "",
-            experience="Entry level" if _entry(text) else "",
             posted_days_ago=_age_days(text),
             listing_url=href,
             req_skills=_skills(text),
@@ -118,29 +113,50 @@ def parse_board(board_url):
     return jobs
 
 
-def resolve_apply_url(listing_url):
-    """Open a Built In job page and return the external ATS/apply link if present."""
-    html = _get(listing_url)
-    if not html:
-        return listing_url
+def parse_detail(html):
+    """Return (apply_url_or_None, age_days, active) from a Built In job page."""
     soup = BeautifulSoup(html, "html.parser")
+    full = soup.get_text(" ", strip=True)
+    head = full[:2500]                       # the header region, before 'Similar Jobs'
+    if any(d in head.lower() for d in _DEAD):
+        return None, 999, False
+    # cut off before the similar-jobs / description noise so we read the real post date
+    for marker in ("Read Full Description", "Similar Jobs", "What We Do"):
+        i = head.find(marker)
+        if i != -1:
+            head = head[:i]
+            break
+    age = _age_days(head)
+    apply_url = None
     for a in soup.find_all("a", href=True):
         if a.get_text(strip=True).lower() == "apply" and any(h in a["href"].lower() for h in _ATS_HINTS):
-            return a["href"]
-    for a in soup.find_all("a", href=True):
-        if any(h in a["href"].lower() for h in _ATS_HINTS):
-            return a["href"]
-    return listing_url
+            apply_url = a["href"]
+            break
+    if not apply_url:
+        for a in soup.find_all("a", href=True):
+            if any(h in a["href"].lower() for h in _ATS_HINTS):
+                apply_url = a["href"]
+                break
+    return apply_url, age, True
 
 
 def discover():
-    """Search all configured boards, dedupe by job_id, resolve direct apply URLs."""
+    """Search boards, dedupe, then read real age + active status from each detail page."""
     seen, out = set(), []
     for board in SOURCE_BOARDS:
         for job in parse_board(board):
             if job.job_id in seen:
                 continue
             seen.add(job.job_id)
-            job.apply_url = resolve_apply_url(job.listing_url)
+            html = _get(job.listing_url)
+            if html:
+                apply_url, age, active = parse_detail(html)
+                if not active:
+                    continue                 # skip removed/closed roles
+                job.apply_url = apply_url or job.listing_url
+                if age < 900:
+                    job.posted_days_ago = age
+            else:
+                job.apply_url = job.listing_url
             out.append(job)
     return out

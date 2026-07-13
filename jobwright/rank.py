@@ -8,8 +8,8 @@ and capped so you get a focused batch.
 """
 from config import CANDIDATE, PREFERRED_LOCATIONS, WEIGHTS, PRIORITY_THRESHOLDS, MAX_POSTING_AGE_DAYS
 
-DEFAULT_LIMIT = 12
-DEFAULT_MIN_SCORE = 60
+DEFAULT_LIMIT = 15
+DEFAULT_MIN_SCORE = 50
 
 
 def _skill_overlap(job):

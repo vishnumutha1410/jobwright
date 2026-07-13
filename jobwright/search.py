@@ -119,7 +119,7 @@ def parse_detail(html):
     full = soup.get_text(" ", strip=True)
     head = full[:2500]                       # the header region, before 'Similar Jobs'
     if any(d in head.lower() for d in _DEAD):
-        return None, 999, False
+        return None, 999, False, ""
     # cut off before the similar-jobs / description noise so we read the real post date
     for marker in ("Read Full Description", "Similar Jobs", "What We Do"):
         i = head.find(marker)
@@ -137,7 +137,11 @@ def parse_detail(html):
             if any(h in a["href"].lower() for h in _ATS_HINTS):
                 apply_url = a["href"]
                 break
-    return apply_url, age, True
+    company = ""
+    c = soup.find("a", href=re.compile(r"/company/"))
+    if c and c.get_text(strip=True):
+        company = c.get_text(strip=True)
+    return apply_url, age, True, company
 
 
 def discover():
@@ -150,10 +154,12 @@ def discover():
             seen.add(job.job_id)
             html = _get(job.listing_url)
             if html:
-                apply_url, age, active = parse_detail(html)
+                apply_url, age, active, company = parse_detail(html)
                 if not active:
                     continue                 # skip removed/closed roles
                 job.apply_url = apply_url or job.listing_url
+                if company:
+                    job.company = company
                 if age < 900:
                     job.posted_days_ago = age
             else:

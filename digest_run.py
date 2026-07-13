@@ -1,32 +1,29 @@
-"""Cloud entry point: discover -> dedupe -> rank -> email a digest of NEW jobs.
+"""Jobwright cloud runner - one Gmail DRAFT per new job, with YOUR resume attached.
 
-Self-contained for GitHub Actions (headless). Emails via Gmail SMTP using an app
-password from env vars, remembers seen jobs in seen.json (committed back by the
-workflow), and alerts if a scan returns nothing so it can't go silent.
-Env: MAIL_USERNAME, MAIL_APP_PASSWORD, MAIL_TO (optional).
+Each new matching role becomes a Gmail draft containing: a personalized cover note,
+pre-written answers to standard screening questions, interview tips, the direct apply
+link, and your real resume (resume.pdf) attached. You review, upload, and submit.
+Never sends, never applies.  Env: MAIL_USERNAME, MAIL_APP_PASSWORD, MAIL_TO (optional).
 """
 import os
-import ssl
 import json
-import smtplib
+import time
+import imaplib
 import logging
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from email.utils import formatdate
 
 from jobwright import search, rank, compose
+import applicant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("jobwright")
 SEEN_PATH = "seen.json"
-
-CARD = (
-    '<div style="border:1px solid #ddd;border-radius:10px;padding:14px 16px;margin:0 0 12px">'
-    '<div style="font-size:16px;font-weight:700">{company} - {title}</div>'
-    '<div style="color:#555;font-size:13px;margin:4px 0">{loc} | {sal} | posted {age}d ago'
-    ' | <b>{score}% match</b> | {prio}</div>'
-    '<div style="font-size:13px;margin:6px 0"><b>Skills:</b> {skills}</div>'
-    '<a href="{url}" style="display:inline-block;margin-top:8px;background:#FF5A2A;color:#fff;'
-    'padding:8px 16px;border-radius:999px;text-decoration:none;font-size:13px">Apply</a></div>'
-)
+RESUME_PATH = "resume.pdf"
+RESUME_FILENAME = "Vishnu_Vardhan_Mutha_Resume.pdf"
+DRAFTS_MAILBOX = '"[Gmail]/Drafts"'
 
 
 def load_seen():
@@ -44,36 +41,32 @@ def save_seen(ids):
         json.dump(sorted(ids), f, indent=0)
 
 
-def send_email(subject, html):
+def _answers_block():
+    lines = ["--- APPLICATION ANSWERS (copy into the form) ---"]
+    for k, v in applicant.ANSWERS.items():
+        lines.append(k + ": " + v)
+    return "\n".join(lines)
+
+
+def create_draft(subject, body, attach=True):
     user = os.environ["MAIL_USERNAME"]
     pw = os.environ["MAIL_APP_PASSWORD"]
     to = os.environ.get("MAIL_TO", user)
-    msg = MIMEText(html, "html")
+    msg = MIMEMultipart()
     msg["Subject"] = subject
     msg["From"] = user
     msg["To"] = to
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
-        s.login(user, pw)
-        s.sendmail(user, [to], msg.as_string())
-
-
-def build_html(jobs):
-    cards = "".join(
-        CARD.format(
-            company=j.company, title=j.title, loc=(j.location or "US"),
-            sal=(j.salary or "salary n/a"), age=j.posted_days_ago, score=j.match_score,
-            prio=j.priority, skills=(", ".join(j.req_skills) or "see listing"), url=j.apply_url,
-        )
-        for j in jobs
-    )
-    return (
-        '<div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto">'
-        "<h2>Jobwright - " + str(len(jobs)) + " new match(es)</h2>"
-        '<p style="color:#666;font-size:13px">Fresh entry-level data roles, ranked to your '
-        "resume. Apply links go straight to the company.</p>" + cards +
-        '<p style="color:#999;font-size:12px">Sent automatically by your Jobwright agent. '
-        "It never applies for you - that is your call.</p></div>"
-    )
+    msg["Date"] = formatdate(localtime=True)
+    msg.attach(MIMEText(body, "plain"))
+    if attach and os.path.exists(RESUME_PATH):
+        with open(RESUME_PATH, "rb") as f:
+            part = MIMEApplication(f.read(), _subtype="pdf")
+        part.add_header("Content-Disposition", "attachment", filename=RESUME_FILENAME)
+        msg.attach(part)
+    imap = imaplib.IMAP4_SSL("imap.gmail.com")
+    imap.login(user, pw)
+    imap.append(DRAFTS_MAILBOX, "\\Draft", imaplib.Time2Internaldate(time.time()), msg.as_bytes())
+    imap.logout()
 
 
 def main():
@@ -86,18 +79,24 @@ def main():
         compose.enrich(j)
     log.info("%d new after dedupe, %d fresh and ranked", len(new), len(ranked))
 
-    if ranked:
-        send_email("Jobwright: " + str(len(ranked)) + " new job match(es)", build_html(ranked))
-        log.info("digest emailed")
+    made = 0
+    for j in ranked:
+        body = compose.email_body(j) + "\n\n" + _answers_block() + \
+            "\n\n[Your resume is attached - upload it when applying.]"
+        subject = "Application - %s at %s (%d%% match)" % (j.title, j.company, j.match_score)
+        create_draft(subject, body, attach=True)
+        made += 1
+
+    if made:
+        log.info("created %d application-package drafts", made)
     elif not found:
-        send_email(
-            "Jobwright: scan came back empty (worth a look)",
-            "<p>This run found 0 listings across all boards. The source markup may have "
-            "changed or the network hiccuped. If it repeats, the scraper needs a tweak.</p>",
-        )
-        log.info("empty-scan alert emailed")
+        create_draft("Jobwright: scan came back empty (worth a look)",
+                     "This run found 0 listings across all boards. The source markup may have "
+                     "changed or the network hiccuped. If it repeats, the scraper needs a tweak.",
+                     attach=False)
+        log.info("empty-scan alert drafted")
     else:
-        log.info("no new matches this run - nothing to send")
+        log.info("no new matches this run - nothing drafted")
 
     save_seen(seen | {j.job_id for j in found})
 
